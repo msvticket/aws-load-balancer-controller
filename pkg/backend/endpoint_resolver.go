@@ -394,9 +394,9 @@ func (r *defaultEndpointResolver) watchExternalName(ctx context.Context, ttl uin
 	case _ = <-ticker.C:
 		var minTTL uint32
 		minTTL, err = r.reconcileExternalNameEndpointSlice(ctx, svc, port)
-		if minTTL == math.MaxUint32 {
-			// Try again in 10 minutes if no TTL was found
-			minTTL = 600
+		if minTTL == math.MaxUint32 || minTTL < 10 {
+			// Try again in 10 seconds if no valid TTL was found. Don't query in less than 10 seconds to avoid churn
+			minTTL = 10
 		}
 		go r.watchExternalName(ctx, minTTL, svc, port)
 	}
@@ -445,7 +445,12 @@ server:
 			c.Net = "udp"
 			resp, _, err := c.Exchange(m, server+":53")
 			if err != nil {
-				//return nil, fmt.Errorf("query failed: %v", err)
+				r.logger.V(1).Info("DNS query for external name failed",
+					"server", server,
+					"domain", domain,
+					"service", svc.GetName(),
+					"namespace", svc.GetNamespace(),
+					"error", err)
 				continue
 			}
 			if resp.Rcode != dns.RcodeSuccess {
@@ -483,10 +488,13 @@ server:
 	if err := r.k8sClient.List(ctx, epSliceList,
 		client.InNamespace(svc.GetNamespace()),
 		client.MatchingLabels(labels)); err != nil {
-		return 0, err
+		return minTTL, err
 	}
 	sort.Strings(addresses)
-	if addresses != nil && len(epSliceList.Items) == 0 {
+	if len(epSliceList.Items) == 0 {
+		if len(addresses) == 0 {
+			return minTTL, nil
+		}
 		// Create EndPointSlice
 		epSlice := &discovery.EndpointSlice{
 			ObjectMeta: metav1.ObjectMeta{
@@ -520,6 +528,11 @@ server:
 	} else if len(epSliceList.Items) == 1 {
 		// Synchronize EndPointSlice
 		persistedES := epSliceList.Items[0]
+		if len(addresses) == 0 {
+			if err = r.k8sClient.Delete(ctx, &persistedES); err != nil {
+				return minTTL, err
+			}
+		}
 		persistedAddresses := persistedES.Endpoints[0].Addresses
 		if !reflect.DeepEqual(persistedAddresses, addresses) {
 			persistedES.Endpoints[0].Addresses = addresses
@@ -530,7 +543,7 @@ server:
 				"namespace", svc.GetNamespace(),
 			)
 			if err = r.k8sClient.Update(ctx, &persistedES); err != nil {
-				return 0, err
+				return minTTL, err
 			}
 		}
 	} else {
